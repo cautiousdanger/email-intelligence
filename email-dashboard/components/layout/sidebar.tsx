@@ -26,6 +26,7 @@ import {
   ListTree,
   Globe2,
   GraduationCap,
+  CalendarDays,
   type LucideIcon,
 } from "lucide-react";
 import { LenisScrollArea } from "@/components/lenis/lenis-scroll-area";
@@ -75,6 +76,7 @@ function userInitials(displayName: string): string {
 const navItemsTop: SidebarNavItem[] = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, iconClassName: "text-violet-500" },
   { href: "/emails", label: "Mailbox", icon: Mail, iconClassName: "text-sky-500" },
+  { href: "/daily-digest", label: "Daily digest", icon: CalendarDays, iconClassName: "text-amber-500" },
   { href: "/threads", label: "Threads", icon: MessageSquare, iconClassName: "text-emerald-500" },
 ];
 
@@ -99,7 +101,7 @@ const adminPipelineDropdownItems: SidebarNavItem[] = [
 
 /** Full admin: links before the pipeline dropdown. */
 const adminNavBeforePipeline: SidebarNavItem[] = [
-  { href: "/admin/team-leaders", label: "Team leaders", icon: UserCircle, iconClassName: "text-pink-500" },
+  { href: "/admin/team-leaders", label: "User management", icon: UserCircle, iconClassName: "text-pink-500" },
   { href: "/admin/team-projects", label: "Projects", icon: FolderKanban, iconClassName: "text-fuchsia-500" },
 ];
 

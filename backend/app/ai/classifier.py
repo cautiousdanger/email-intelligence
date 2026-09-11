@@ -688,13 +688,19 @@ def classify_email_fields(
     body_content: str | None,
     sender_email: str,
     correlation_id: str | None = None,
+    email_id: str | None = None,
 ) -> dict[str, Any]:
     """Classify only: category/priority (+ optional lead fields)."""
     correlation_id = correlation_id or "none"
+    email_id_log = email_id or "-"
     settings = get_settings()
     prompt = _build_classify_only_prompt(subject, body_preview, body_content, sender_email)
     if not _parse_ollama_urls_for_classify(settings):
-        logger.info("AI_RESPONSE: skipped_no_provider correlation_id=%s", correlation_id)
+        logger.info(
+            "AI_CLASSIFY: email_id=%s correlation_id=%s skipped_no_provider",
+            email_id_log,
+            correlation_id,
+        )
         return {"category": None, "priority_score": 50.0, "priority_label": "Medium", "lead_label": None, "buying_signals": []}
     ollama_timeout = float(settings.ollama_request_timeout_seconds or LLM_TIMEOUT_DEFAULT)
     ollama_retries = max(1, int(settings.ollama_max_retries))
@@ -709,7 +715,8 @@ def classify_email_fields(
             latency_ms = (time.perf_counter() - start) * 1000
             out = _content_to_classify_only_result(content, correlation_id)
             logger.info(
-                "AI_CLASSIFY: provider=ollama correlation_id=%s latency_ms=%.0f attempt=%d content_length=%d",
+                "AI_CLASSIFY: email_id=%s correlation_id=%s provider=ollama latency_ms=%.0f attempt=%d content_length=%d",
+                email_id_log,
                 correlation_id,
                 latency_ms,
                 attempt + 1,
@@ -719,16 +726,27 @@ def classify_email_fields(
         except Exception as e:
             last_err = e
             logger.warning(
-                "AI_CLASSIFY: ollama_error correlation_id=%s attempt=%d error=%s",
+                "AI_CLASSIFY: email_id=%s correlation_id=%s ollama_error attempt=%d error=%s",
+                email_id_log,
                 correlation_id,
                 attempt + 1,
                 str(e),
             )
             if attempt < ollama_retries - 1:
                 delay = ollama_retry_delay * (2**attempt)
-                logger.info("AI_CLASSIFY: ollama_retry correlation_id=%s delay=%.2fs", correlation_id, delay)
+                logger.info(
+                    "AI_CLASSIFY: email_id=%s correlation_id=%s ollama_retry delay=%.2fs",
+                    email_id_log,
+                    correlation_id,
+                    delay,
+                )
                 time.sleep(delay)
-    logger.info("AI_CLASSIFY: ollama_failed correlation_id=%s error=%s", correlation_id, str(last_err))
+    logger.info(
+        "AI_CLASSIFY: email_id=%s correlation_id=%s ollama_failed error=%s",
+        email_id_log,
+        correlation_id,
+        str(last_err),
+    )
     return {"category": None, "priority_score": 50.0, "priority_label": "Medium", "lead_label": None, "buying_signals": []}
 
 
@@ -739,9 +757,11 @@ def generate_email_summary(
     sender_email: str,
     correlation_id: str | None = None,
     attachment_document_excerpt: str | None = None,
+    email_id: str | None = None,
 ) -> dict[str, Any]:
     """On-demand summary generation: summary + suggested replies."""
     correlation_id = correlation_id or "none"
+    email_id_log = email_id or "-"
     settings = get_settings()
     prompt = _build_summary_only_prompt(
         subject,
@@ -751,7 +771,11 @@ def generate_email_summary(
         attachment_document_excerpt=attachment_document_excerpt,
     )
     if not _parse_ollama_urls_for_summary(settings):
-        logger.info("AI_SUMMARY: skipped_no_provider correlation_id=%s", correlation_id)
+        logger.info(
+            "AI_SUMMARY: email_id=%s correlation_id=%s skipped_no_provider",
+            email_id_log,
+            correlation_id,
+        )
         return {"summary": None, "suggested_replies": []}
     ollama_timeout = float(settings.ollama_request_timeout_seconds or LLM_TIMEOUT_DEFAULT)
     ollama_retries = max(1, int(settings.ollama_max_retries))
@@ -779,7 +803,8 @@ def generate_email_summary(
                 sender_email=sender_email,
             )
             logger.info(
-                "AI_SUMMARY: provider=ollama correlation_id=%s latency_ms=%.0f attempt=%d content_length=%d",
+                "AI_SUMMARY: email_id=%s correlation_id=%s provider=ollama latency_ms=%.0f attempt=%d content_length=%d",
+                email_id_log,
                 correlation_id,
                 latency_ms,
                 attempt + 1,
@@ -789,20 +814,60 @@ def generate_email_summary(
         except Exception as e:
             last_err = e
             logger.warning(
-                "AI_SUMMARY: ollama_error correlation_id=%s attempt=%d error=%s",
+                "AI_SUMMARY: email_id=%s correlation_id=%s ollama_error attempt=%d error=%s",
+                email_id_log,
                 correlation_id,
                 attempt + 1,
                 str(e),
             )
             if attempt < ollama_retries - 1:
                 delay = ollama_retry_delay * (2**attempt)
-                logger.info("AI_SUMMARY: ollama_retry correlation_id=%s delay=%.2fs", correlation_id, delay)
+                logger.info(
+                    "AI_SUMMARY: email_id=%s correlation_id=%s ollama_retry delay=%.2fs",
+                    email_id_log,
+                    correlation_id,
+                    delay,
+                )
                 time.sleep(delay)
-    logger.info("AI_SUMMARY: ollama_failed correlation_id=%s error=%s", correlation_id, str(last_err))
+    logger.info(
+        "AI_SUMMARY: email_id=%s correlation_id=%s ollama_failed error=%s",
+        email_id_log,
+        correlation_id,
+        str(last_err),
+    )
     return {"summary": None, "suggested_replies": []}
 
 
 BATCH_CLASSIFICATION_SUMMARY_MAX_TOKENS = 1024
+DAILY_BULK_SUMMARY_MAX_TOKENS = 2048
+DAILY_BULK_SUMMARY_TIMEOUT_SECONDS = 120.0
+
+_PLACEHOLDER_SUMMARY_LINE = re.compile(
+    r"^\d*\.?\s*\(?\s*no\s+(second|other|additional|more)\s+email",
+    re.IGNORECASE,
+)
+_EMPTY_NUMBERED_LINE = re.compile(r"^\d+\.\s*$")
+
+
+def _sanitize_daily_bulk_summary_text(text: str) -> str:
+    """Remove bogus placeholder lines the model sometimes adds for single-email days."""
+    if not text or not text.strip():
+        return text
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            kept.append(line)
+            continue
+        if _PLACEHOLDER_SUMMARY_LINE.search(stripped):
+            continue
+        if _EMPTY_NUMBERED_LINE.match(stripped):
+            continue
+        if stripped.lower().startswith("no email") and "received" in stripped.lower():
+            continue
+        kept.append(line)
+    out = "\n".join(kept)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
 def generate_classification_batch_summary_text(bundle_text: str, correlation_id: str = "batch") -> str:
@@ -862,4 +927,138 @@ Write ONE cohesive brief in plain text (2-4 short paragraphs). Highlight cross-c
             if attempt < ollama_retries - 1:
                 time.sleep(ollama_retry_delay * (2**attempt))
     logger.info("BATCH_SUMMARY: ollama_failed correlation_id=%s err=%s", correlation_id, last_err)
+    return ""
+
+
+def generate_daily_bulk_summary_text(
+    bundle_text: str,
+    email_count: int,
+    date_str: str,
+    correlation_id: str = "daily",
+    mailbox: str | None = None,
+    queue_name: str = "daily_bulk",
+    queue_pending: int = 0,
+    queue_active: int = 0,
+    bundle_count: int | None = None,
+) -> str:
+    """
+    One plain-text digest for all emails received on a calendar day in a mailbox.
+    Ollama only.
+    """
+    settings = get_settings()
+    mailbox_log = mailbox or "-"
+    safe_bundle = _escape_for_format(bundle_text)
+    listed = bundle_count if bundle_count is not None else email_count
+    list_note = (
+        f"All {email_count} emails are listed below."
+        if listed >= email_count
+        else f"{listed} of {email_count} emails are listed below (oldest first)."
+    )
+    prompt = f"""You help an email intelligence dashboard. Summarize one completed mailbox day using ONLY the evidence below.
+
+Date: {date_str} (UTC calendar day). Total emails received that day: {email_count}. {list_note}
+
+CRITICAL ACCURACY RULES:
+- Use ONLY facts from the email list below. Do NOT invent senders, subjects, companies, topics, or action items.
+- When you name a sender, subject, or domain, it MUST appear in the list below.
+- If a field is missing in the source data, do not guess.
+- Counts and urgency must match the listed emails (category, priority, flags).
+
+OUTPUT STRUCTURE (use Markdown **bold** for section labels—no HTML):
+
+**Summary:**
+- Write EXACTLY {email_count} email block(s)—one per email in the source list, no more and no fewer.
+- Do NOT number the blocks (no "1.", "2.", etc.). Do NOT add placeholder entries such as "(No second email received on this day)" or empty items for emails that do not exist.
+- For each email (oldest first):
+  • One line: the subject in **bold** (exact subject from the source list).
+  • Next line(s): one short paragraph (1-3 sentences) about ONLY that email.
+- Separate each email block with a blank line.
+- If there is only ONE email, **Summary** must contain only ONE subject line and ONE paragraph—nothing else before **Key topics:**.
+
+**Key topics:**
+- Bullet list of cross-cutting themes across the day (synthesized).
+
+**Important senders:**
+- Bullet list of notable senders with name and email when available.
+
+Optional **Next steps:** only if clearly supported by the emails.
+
+Keep **Key topics** and **Important senders** as concise bullet lists. Do not repeat the per-email paragraphs there.
+
+--- Emails for {date_str} ---
+{safe_bundle}
+--- End ---"""
+
+    use_ollama = bool(_parse_ollama_urls_for_summary(settings))
+    if not use_ollama:
+        logger.info(
+            "DAILY_BULK_SUMMARY: date=%s mailbox=%s email_count=%d correlation_id=%s queue=%s pending=%d active=%d skipped_no_provider",
+            date_str,
+            mailbox_log,
+            email_count,
+            correlation_id,
+            queue_name,
+            queue_pending,
+            queue_active,
+        )
+        return ""
+
+    ollama_timeout = max(
+        DAILY_BULK_SUMMARY_TIMEOUT_SECONDS,
+        float(settings.ollama_request_timeout_seconds or LLM_TIMEOUT_DEFAULT),
+    )
+    ollama_retries = max(1, int(settings.ollama_max_retries))
+    ollama_retry_delay = max(0.0, float(settings.ollama_retry_delay_seconds))
+    last_err: Exception | None = None
+    for attempt in range(ollama_retries):
+        try:
+            base_url = _pick_ollama_base_url_for_summary(settings)
+            client = _get_ollama_client(base_url)
+            start = time.perf_counter()
+            out = _call_llm(
+                client,
+                settings.ollama_model,
+                prompt,
+                timeout=ollama_timeout,
+                max_tokens=DAILY_BULK_SUMMARY_MAX_TOKENS,
+            )
+            latency_ms = (time.perf_counter() - start) * 1000
+            if out:
+                logger.info(
+                    "DAILY_BULK_SUMMARY: date=%s mailbox=%s email_count=%d correlation_id=%s provider=ollama "
+                    "latency_ms=%.0f attempt=%d content_length=%d queue=%s pending=%d active=%d",
+                    date_str,
+                    mailbox_log,
+                    email_count,
+                    correlation_id,
+                    latency_ms,
+                    attempt + 1,
+                    len(out),
+                    queue_name,
+                    queue_pending,
+                    queue_active,
+                )
+                return _sanitize_daily_bulk_summary_text(out)
+            raise ValueError("empty response")
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "DAILY_BULK_SUMMARY: date=%s mailbox=%s email_count=%d correlation_id=%s ollama_error attempt=%d err=%s",
+                date_str,
+                mailbox_log,
+                email_count,
+                correlation_id,
+                attempt + 1,
+                e,
+            )
+            if attempt < ollama_retries - 1:
+                time.sleep(ollama_retry_delay * (2**attempt))
+    logger.info(
+        "DAILY_BULK_SUMMARY: date=%s mailbox=%s email_count=%d correlation_id=%s ollama_failed err=%s",
+        date_str,
+        mailbox_log,
+        email_count,
+        correlation_id,
+        last_err,
+    )
     return ""

@@ -19,6 +19,7 @@ import type {
   LeadsResponse,
   TeamOut,
   UserOut,
+  UserEmailCountOut,
   UserEscalationCountOut,
   UserLeadCountOut,
   WorkflowNode,
@@ -37,6 +38,8 @@ import type {
   RetagActionResponse,
   RetagApprovalOut,
   MyRetagRequestsResponse,
+  DailyBulkSummariesResponse,
+  DailyBulkSummaryGenerateResponse,
 } from "@/lib/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -132,6 +135,13 @@ function createApi(userEmail: string | null, userDisplayName?: string | null) {
       }),
     getDashboardMetrics: (period?: "daily" | "weekly" | "monthly" | "yearly") =>
       withUser<DashboardMetrics>(`/api/dashboard/metrics${period ? `?period=${encodeURIComponent(period)}` : ""}`),
+    getDailyBulkSummaries: () =>
+      withUser<DailyBulkSummariesResponse>("/api/dashboard/daily-bulk-summaries"),
+    generateDailyBulkSummary: (date: string) =>
+      withUser<DailyBulkSummaryGenerateResponse>(
+        `/api/dashboard/daily-bulk-summaries/${encodeURIComponent(date)}/generate`,
+        { method: "POST" }
+      ),
     /**
      * Dashboard calendar list. Default: meeting invites from synced Mail (`source=mail`, no Calendars.Read).
      * Optional `source=graph` + Bearer for legacy Graph calendarView.
@@ -452,6 +462,7 @@ function createApi(userEmail: string | null, userDisplayName?: string | null) {
       const q = searchParams.toString();
       return withUser<UserOut[]>(`/api/admin/users${q ? `?${q}` : ""}`);
     },
+    getUserEmailCounts: () => withUser<UserEmailCountOut[]>("/api/admin/users/email-counts"),
     getRecentSignIns: (params?: { limit?: number }) => {
       const searchParams = new URLSearchParams();
       if (params?.limit != null) searchParams.set("limit", String(params.limit));

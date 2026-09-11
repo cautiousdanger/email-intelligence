@@ -31,6 +31,7 @@ from app.workers.user_queue import (
     count_active_reserved_for_mailbox,
     user_queue_get,
 )
+from app.workers.queue_stats import get_ai_queue_stats, QUEUE_AI_CLASSIFY, QUEUE_AI_SUMMARY
 from app.graph.mail_folders import (
     filter_folders_for_sync,
     list_user_mail_folders_flat,
@@ -588,6 +589,17 @@ def classify_email_task(self, email_id: str, mailbox_owner_email: str | None = N
     """
     _ensure_tables()
     correlation_id = str(uuid.uuid4())[:8]
+    mb = (mailbox_owner_email or "").strip().lower()
+    q = get_ai_queue_stats(QUEUE_AI_CLASSIFY)
+    logger.info(
+        "CLASSIFY_START: email_id=%s correlation_id=%s queue=%s pending=%d active=%d mailbox=%s",
+        email_id,
+        correlation_id,
+        QUEUE_AI_CLASSIFY,
+        q["pending"],
+        q["active"],
+        mb,
+    )
     db = SessionLocal()
     try:
         email = db.query(Email).filter(Email.id == email_id).first()
@@ -608,6 +620,7 @@ def classify_email_task(self, email_id: str, mailbox_owner_email: str | None = N
             body_content=email.body_content,
             sender_email=email.sender_email or "",
             correlation_id=correlation_id,
+            email_id=email_id,
         )
         latency = time.perf_counter() - start
         _record_ai_latency(latency)
@@ -761,6 +774,17 @@ def generate_email_summary_task(self, email_id: str, mailbox_owner_email: str | 
     """On-demand summary generation for one email (summary + suggested replies only)."""
     _ensure_tables()
     correlation_id = str(uuid.uuid4())[:8]
+    mb = (mailbox_owner_email or "").strip().lower()
+    q = get_ai_queue_stats(QUEUE_AI_SUMMARY)
+    logger.info(
+        "SUMMARY_START: email_id=%s correlation_id=%s queue=%s pending=%d active=%d mailbox=%s",
+        email_id,
+        correlation_id,
+        QUEUE_AI_SUMMARY,
+        q["pending"],
+        q["active"],
+        mb,
+    )
     db = SessionLocal()
     try:
         email = db.query(Email).filter(Email.id == email_id).first()
@@ -781,6 +805,7 @@ def generate_email_summary_task(self, email_id: str, mailbox_owner_email: str | 
             sender_email=email.sender_email or "",
             correlation_id=correlation_id,
             attachment_document_excerpt=doc_excerpt or None,
+            email_id=email_id,
         )
         latency = time.perf_counter() - start
         _record_ai_latency(latency)
@@ -806,6 +831,12 @@ def generate_email_summary_task(self, email_id: str, mailbox_owner_email: str | 
                 email.ai_summary_error_message = "Empty summary returned"
                 email.ai_summary_processed_at = datetime.now(timezone.utc)
         db.commit()
+        logger.info(
+            "DB_SAVE_STATUS: saved correlation_id=%s email_id=%s ai_summary_status=%s",
+            correlation_id,
+            email_id,
+            "completed" if has_summary else "failed",
+        )
     except Exception as e:
         db.rollback()
         err_msg = str(e)
@@ -969,6 +1000,14 @@ def generate_daily_summary_task(self, date_str: str | None = None):
                 .first()
             )
             if existing:
+                old = existing.summary or {}
+                for key in (
+                    "bulkSummaryText",
+                    "bulkSummaryGeneratedAt",
+                    "bulkSummaryEmailSampleCount",
+                ):
+                    if key in old:
+                        summary[key] = old[key]
                 existing.summary = summary
                 existing.created_at = now
             else:

@@ -2,8 +2,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from urllib.parse import quote
 import re
+import logging
 import httpx
-from fastapi import APIRouter, Depends, Query, Header
+from fastapi import APIRouter, Depends, Query, Header, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import OperationalError
@@ -14,7 +16,157 @@ from app.api.deps import get_current_user_email
 from app.graph.auth import get_auth_headers
 from app.http_client import httpx_client
 
+from app.workers.queue_stats import (
+    daily_bulk_summary_acquire,
+    daily_bulk_summary_release,
+    QUEUE_DAILY_BULK,
+)
+
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+DAILY_BULK_SUMMARY_DAYS = 5
+DAILY_BULK_EMAIL_LIMIT = 300
+# Digests only cover completed UTC days (yesterday and earlier).
+DAILY_BULK_MIN_DAY_OFFSET = 1
+
+
+def _utc_today_start() -> datetime:
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _is_completed_utc_day(day_start: datetime) -> bool:
+    return day_start < _utc_today_start()
+
+
+def _digest_day_offsets(days: int) -> range:
+    """UTC day offsets from today: 1=yesterday, 2=day before, …"""
+    n = min(max(1, days), DAILY_BULK_SUMMARY_DAYS)
+    return range(DAILY_BULK_MIN_DAY_OFFSET, DAILY_BULK_MIN_DAY_OFFSET + n)
+
+
+def _parse_summary_date(date_str: str) -> datetime:
+    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def _daily_summary_row(db: Session, mbox: str, day_start: datetime) -> DailySummary | None:
+    return (
+        db.query(DailySummary)
+        .filter(
+            DailySummary.summary_date == day_start,
+            DailySummary.mailbox_owner_email.isnot(None),
+            func.lower(DailySummary.mailbox_owner_email) == mbox,
+        )
+        .first()
+    )
+
+
+def _emails_for_day(
+    db: Session,
+    mbox: str,
+    day_start: datetime,
+    day_end: datetime,
+    limit: int = DAILY_BULK_EMAIL_LIMIT,
+) -> list[Email]:
+    return (
+        db.query(Email)
+        .filter(
+            func.lower(Email.mailbox_owner_email) == mbox,
+            Email.deleted_at.is_(None),
+            Email.received_at >= day_start,
+            Email.received_at < day_end,
+        )
+        .order_by(Email.received_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def _build_daily_email_bundle(rows: list[Email], total_count: int) -> tuple[str, int]:
+    """Build LLM input from emails received on one UTC day. Returns (bundle text, rows included)."""
+    lines: list[str] = []
+    for i, e in enumerate(rows, 1):
+        subj = (e.subject or "-").replace("\n", " ").strip()[:240]
+        sender = (e.sender_email or "-").strip()
+        sender_name = (e.sender_display_name or "").replace("\n", " ").strip()[:120]
+        from_line = f"{sender_name} <{sender}>" if sender_name else sender
+        recv = e.received_at.isoformat() if e.received_at else "-"
+        cat = (e.ai_category or "-").strip()
+        pri = (e.ai_priority_label or "-").strip()
+        flags: list[str] = []
+        if getattr(e, "is_escalation", None):
+            flags.append("escalation")
+        lead = getattr(e, "lead_label", None)
+        if lead:
+            flags.append(f"lead={lead}")
+        flag_str = ", ".join(flags) if flags else "none"
+        if e.ai_summary and e.ai_summary.strip():
+            snippet = e.ai_summary.replace("\n", " ").strip()[:500]
+            label = "AI summary"
+        elif e.body_preview and e.body_preview.strip():
+            snippet = e.body_preview.replace("\n", " ").strip()[:400]
+            label = "Preview"
+        elif e.body_content and e.body_content.strip():
+            snippet = e.body_content.replace("\n", " ").strip()[:400]
+            label = "Body excerpt"
+        else:
+            snippet = "-"
+            label = "Content"
+        lines.append(
+            f"{i}. Received: {recv}\n"
+            f"   Subject: {subj}\n"
+            f"   From: {from_line}\n"
+            f"   Category: {cat} | Priority: {pri} | Flags: {flag_str}\n"
+            f"   {label}: {snippet}"
+        )
+    header = ""
+    if rows and total_count > len(rows):
+        header = (
+            f"(Listing {len(rows)} of {total_count} emails received this UTC day, "
+            f"oldest first.)\n\n"
+        )
+    elif total_count > 0:
+        header = f"(All {total_count} emails received this UTC day, oldest first.)\n\n"
+    return header + "\n".join(lines), len(rows)
+
+
+def _save_daily_bulk_summary(
+    db: Session,
+    mbox: str,
+    day_start: datetime,
+    bulk_text: str | None,
+    email_count: int,
+) -> None:
+    now = datetime.now(timezone.utc)
+    existing = _daily_summary_row(db, mbox, day_start)
+    base: dict[str, Any] = {
+        "date": day_start.strftime("%Y-%m-%d"),
+        "mailboxOwnerEmail": mbox,
+        "totalReceived": email_count,
+    }
+    if existing:
+        merged = dict(existing.summary or {})
+        merged.update(base)
+        if bulk_text is not None:
+            merged["bulkSummaryText"] = bulk_text
+            merged["bulkSummaryGeneratedAt"] = now.isoformat()
+            merged["bulkSummaryEmailSampleCount"] = min(email_count, DAILY_BULK_EMAIL_LIMIT)
+        existing.summary = merged
+        existing.created_at = now
+    else:
+        summary = dict(base)
+        if bulk_text is not None:
+            summary["bulkSummaryText"] = bulk_text
+            summary["bulkSummaryGeneratedAt"] = now.isoformat()
+            summary["bulkSummaryEmailSampleCount"] = min(email_count, DAILY_BULK_EMAIL_LIMIT)
+        db.add(
+            DailySummary(
+                summary_date=day_start,
+                mailbox_owner_email=mbox,
+                summary=summary,
+            )
+        )
+    db.commit()
 
 
 _CALENDAR_SELECT_ORDER = (
@@ -665,6 +817,147 @@ def get_daily_summary(
         return {"summaries": summaries, "date": date}
     except (OperationalError, Exception):
         return {"summaries": [], "date": date}
+
+
+@router.get("/daily-bulk-summaries")
+def list_daily_bulk_summaries(
+    current_user_email: str = Depends(get_current_user_email),
+    db: Session = Depends(get_db),
+    days: int = Query(DAILY_BULK_SUMMARY_DAYS, ge=1, le=DAILY_BULK_SUMMARY_DAYS),
+):
+    """Last N completed UTC calendar days (yesterday through N days ago) with counts and cached digests."""
+    mbox = (current_user_email or "").strip().lower()
+    if not mbox:
+        return {"days": []}
+    today = _utc_today_start()
+    out: list[dict[str, Any]] = []
+    for offset in _digest_day_offsets(days):
+        day_start = today - timedelta(days=offset)
+        day_end = day_start + timedelta(days=1)
+        email_count = (
+            db.query(Email)
+            .filter(
+                func.lower(Email.mailbox_owner_email) == mbox,
+                Email.deleted_at.is_(None),
+                Email.received_at >= day_start,
+                Email.received_at < day_end,
+            )
+            .count()
+        )
+        row = _daily_summary_row(db, mbox, day_start)
+        bulk = None
+        if row and isinstance(row.summary, dict):
+            raw = row.summary.get("bulkSummaryText")
+            if isinstance(raw, str) and raw.strip():
+                bulk = raw.strip()
+        out.append(
+            {
+                "date": day_start.strftime("%Y-%m-%d"),
+                "emailCount": email_count,
+                "bulkSummary": bulk,
+                "isCompleteDay": True,
+            }
+        )
+    return {"days": out}
+
+
+@router.post("/daily-bulk-summaries/{date}/generate")
+def generate_daily_bulk_summary(
+    date: str,
+    current_user_email: str = Depends(get_current_user_email),
+    db: Session = Depends(get_db),
+):
+    """Build one Ollama plain-text digest for all emails received on the given UTC day."""
+    import uuid as uuid_mod
+
+    from app.config import get_settings
+    from app.ai.classifier import generate_daily_bulk_summary_text, ollama_summary_configured
+
+    mbox = (current_user_email or "").strip().lower()
+    if not mbox:
+        raise HTTPException(status_code=400, detail="Missing user")
+    try:
+        day_start = _parse_summary_date(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format (use YYYY-MM-DD)")
+    if not _is_completed_utc_day(day_start):
+        raise HTTPException(
+            status_code=400,
+            detail="Daily digest is only generated for completed UTC days (yesterday and earlier).",
+        )
+    day_end = day_start + timedelta(days=1)
+    email_count = (
+        db.query(Email)
+        .filter(
+            func.lower(Email.mailbox_owner_email) == mbox,
+            Email.deleted_at.is_(None),
+            Email.received_at >= day_start,
+            Email.received_at < day_end,
+        )
+        .count()
+    )
+    if email_count == 0:
+        return {"ok": True, "date": date, "emailCount": 0, "bulkSummary": None}
+
+    settings = get_settings()
+    if not ollama_summary_configured(settings):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "No AI provider configured for daily digest. Set OLLAMA_SUMMARY_BASE_URL or OLLAMA_BASE_URL.",
+            },
+        )
+
+    rows = _emails_for_day(db, mbox, day_start, day_end)
+    bundle, bundle_count = _build_daily_email_bundle(rows, email_count)
+    cid = str(uuid_mod.uuid4())[:8]
+    queue_stats = daily_bulk_summary_acquire()
+    try:
+        logger.info(
+            "BULK_SUMMARY_START: date=%s mailbox=%s email_count=%d correlation_id=%s queue=%s pending=%d active=%d",
+            date,
+            mbox,
+            email_count,
+            cid,
+            QUEUE_DAILY_BULK,
+            queue_stats["pending"],
+            queue_stats["active"],
+        )
+        text = generate_daily_bulk_summary_text(
+            bundle,
+            email_count=email_count,
+            bundle_count=bundle_count,
+            date_str=date,
+            correlation_id=cid,
+            mailbox=mbox,
+            queue_name=QUEUE_DAILY_BULK,
+            queue_pending=queue_stats["pending"],
+            queue_active=queue_stats["active"],
+        )
+        bulk = text.strip() if text and text.strip() else None
+        if not bulk:
+            logger.warning(
+                "DB_SAVE_STATUS: bulk_summary correlation_id=%s date=%s mailbox=%s email_count=%d has_summary=False",
+                cid,
+                date,
+                mbox,
+                email_count,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Could not generate daily digest. Try again later."},
+            )
+        _save_daily_bulk_summary(db, mbox, day_start, bulk, email_count)
+        logger.info(
+            "DB_SAVE_STATUS: bulk_summary correlation_id=%s date=%s mailbox=%s email_count=%d has_summary=True",
+            cid,
+            date,
+            mbox,
+            email_count,
+        )
+        return {"ok": True, "date": date, "emailCount": email_count, "bulkSummary": bulk}
+    finally:
+        daily_bulk_summary_release()
 
 
 @router.post("/daily-summary/generate")

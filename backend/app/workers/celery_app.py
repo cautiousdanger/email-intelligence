@@ -21,6 +21,7 @@ celery_app = Celery(
 )
 # Ensure all tasks (including backfill_classify_emails_task) are registered when app loads
 import app.workers.tasks  # noqa: F401, E402
+import app.workers.queue_stats  # noqa: F401, E402 — task_prerun logging
 
 celery_app.conf.update(
     task_serializer="json",

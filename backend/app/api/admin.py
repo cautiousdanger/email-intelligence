@@ -100,10 +100,19 @@ class UserOut(BaseModel):
     managerId: str | None = Field(None, alias="managerId")
     isTeamLead: bool = Field(False, alias="isTeamLead")
     reportCount: int = 0
+    emailCount: int = Field(0, alias="emailCount")
     lastLoginAt: datetime | None = None
     createdAt: datetime | None = None
 
     model_config = {"from_attributes": True, "populate_by_name": True}
+
+
+class UserEmailCountOut(BaseModel):
+    userId: str = Field(alias="userId")
+    email: str
+    emailCount: int = Field(0, alias="emailCount")
+
+    model_config = {"populate_by_name": True}
 
 
 class WorkflowNode(BaseModel):
@@ -471,15 +480,32 @@ def get_team_status(
 
 
 # --- Users ---
-@router.get("/users", response_model=list[UserOut])
-def list_users(
-    db: Session = Depends(get_db),
-    role: str | None = Query(None, description="Filter by role: Admin, Manager, Member"),
-    team_id: str | None = Query(None, alias="teamId"),
-    _auth: str = Depends(get_admin_or_manager_user),
-    actor_email: str = Depends(get_current_user_email),
+
+def _mailbox_email_counts(db: Session, mailbox_emails: list[str]) -> dict[str, int]:
+    """Non-deleted email totals per mailbox (lowercase key)."""
+    lowered = list({(e or "").strip().lower() for e in mailbox_emails if (e or "").strip()})
+    if not lowered:
+        return {}
+    rows = (
+        db.query(func.lower(Email.mailbox_owner_email), func.count(Email.id))
+        .filter(
+            Email.deleted_at.is_(None),
+            func.lower(Email.mailbox_owner_email).in_(lowered),
+        )
+        .group_by(func.lower(Email.mailbox_owner_email))
+        .all()
+    )
+    return {mbox: int(cnt) for mbox, cnt in rows if mbox}
+
+
+def _scoped_users_query(
+    db: Session,
+    actor_email: str,
+    *,
+    role: str | None = None,
+    team_id: str | None = None,
 ):
-    """List users with role, team, manager. Optional filter by role or team."""
+    """Users visible to the actor (admin: all; manager: self + reports + team)."""
     q = db.query(User).order_by(User.email)
     is_admin_actor = _is_admin_actor(db, actor_email)
     manager_row = None if is_admin_actor else _manager_actor_row(db, actor_email)
@@ -492,11 +518,44 @@ def list_users(
         q = q.filter(User.role == role.strip())
     if is_admin_actor and team_id and team_id.strip():
         q = q.filter(User.team_id == team_id.strip())
-    users = q.all()
+    return q
+
+
+@router.get("/users/email-counts", response_model=list[UserEmailCountOut])
+def list_user_email_counts(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(get_admin_or_manager_user),
+    actor_email: str = Depends(get_current_user_email),
+):
+    """Lightweight per-user mailbox email totals for live UI refresh during ingest."""
+    users = _scoped_users_query(db, actor_email).all()
+    email_counts = _mailbox_email_counts(db, [u.email for u in users])
+    return [
+        UserEmailCountOut(
+            userId=u.id,
+            email=u.email,
+            emailCount=email_counts.get((u.email or "").strip().lower(), 0),
+        )
+        for u in users
+    ]
+
+
+@router.get("/users", response_model=list[UserOut])
+def list_users(
+    db: Session = Depends(get_db),
+    role: str | None = Query(None, description="Filter by role: Admin, Manager, Member"),
+    team_id: str | None = Query(None, alias="teamId"),
+    _auth: str = Depends(get_admin_or_manager_user),
+    actor_email: str = Depends(get_current_user_email),
+):
+    """List users with role, team, manager. Optional filter by role or team."""
+    users = _scoped_users_query(db, actor_email, role=role, team_id=team_id).all()
+    email_counts = _mailbox_email_counts(db, [u.email for u in users])
     result = []
     for u in users:
         team_name = u.team.name if u.team else None
         report_count = db.query(User).filter(User.manager_id == u.id).count()
+        mbox_key = (u.email or "").strip().lower()
         result.append(
             UserOut(
                 id=u.id,
@@ -508,6 +567,7 @@ def list_users(
                 managerId=u.manager_id,
                 isTeamLead=u.is_team_lead,
                 reportCount=report_count,
+                emailCount=email_counts.get(mbox_key, 0),
                 lastLoginAt=u.last_login_at,
                 createdAt=u.created_at,
             )
@@ -1521,6 +1581,7 @@ def admin_list_emails(
                 processingStatus=getattr(r, "processing_status", None),
                 assignedTeam=getattr(r, "assigned_team", None),
                 mailboxOwnerEmail=getattr(r, "mailbox_owner_email", None),
+                deletedAt=getattr(r, "deleted_at", None) if deleted_only else None,
             )
             for r in rows
         ]

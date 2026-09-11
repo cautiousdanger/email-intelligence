@@ -182,7 +182,7 @@ function DeletedMailContent() {
         emails={emails}
         isLoading={loading}
         emptyMessage={categoryFilter ? `No deleted mail in ${categoryFilter}.` : "No deleted mail."}
-        getEmailLink={(e) => `/emails/${e.id}`}
+        readOnly
         showRetag={false}
         showMailbox
       />

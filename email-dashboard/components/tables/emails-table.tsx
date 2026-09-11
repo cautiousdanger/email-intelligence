@@ -56,7 +56,8 @@ export function EmailsTable({
 }: EmailsTableProps) {
   const router = useRouter();
   const shouldShowRetag = showRetag ?? true;
-  const isClickable = !!getEmailLink && !readOnly;
+  const canOpenEmail = (email: EmailRecord) =>
+    !!getEmailLink && !readOnly && !email.deletedAt;
   const slim = hideDepartmentPriorityFolder;
 
   if (isLoading) {
@@ -169,11 +170,12 @@ export function EmailsTable({
     <div className={cn("min-w-0", className)}>
       <div className="glass-surface space-y-3 rounded-2xl p-3 md:hidden">
         {emails.map((email) => {
+          const rowClickable = canOpenEmail(email);
           const go = () => {
-            if (getEmailLink && !readOnly) router.push(getEmailLink(email));
+            if (rowClickable && getEmailLink) router.push(getEmailLink(email));
           };
           const onKeyDown = (e: KeyboardEvent) => {
-            if (!isClickable) return;
+            if (!rowClickable) return;
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               go();
@@ -184,11 +186,11 @@ export function EmailsTable({
               key={email.id}
               className={cn(
                 "rounded-xl border border-border/80 bg-panel/80 p-3 shadow-sm transition-colors",
-                isClickable && "cursor-pointer hover:border-border active:bg-muted/50"
+                rowClickable && "cursor-pointer hover:border-border active:bg-muted/50"
               )}
-              role={isClickable ? "button" : undefined}
-              tabIndex={isClickable ? 0 : undefined}
-              onClick={isClickable ? go : undefined}
+              role={rowClickable ? "button" : undefined}
+              tabIndex={rowClickable ? 0 : undefined}
+              onClick={rowClickable ? go : undefined}
               onKeyDown={onKeyDown}
             >
               <p className="line-clamp-2 font-medium leading-snug text-foreground" title={email.summary ?? undefined}>
@@ -264,17 +266,18 @@ export function EmailsTable({
             </thead>
             <tbody>
               {emails.map((email) => {
+                const rowClickable = canOpenEmail(email);
                 const rowClass = cn(
                   "border-b border-border/60 transition-colors",
-                  !readOnly && "hover:bg-muted/60"
+                  rowClickable && "cursor-pointer hover:bg-muted/60"
                 );
                 return (
                   <tr
                     key={email.id}
-                    className={cn(rowClass, isClickable && "cursor-pointer")}
-                    onClick={isClickable ? () => router.push(getEmailLink!(email)) : undefined}
+                    className={rowClass}
+                    onClick={rowClickable ? () => router.push(getEmailLink!(email)) : undefined}
                     onKeyDown={
-                      isClickable
+                      rowClickable
                         ? (e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
@@ -283,8 +286,8 @@ export function EmailsTable({
                         }
                         : undefined
                     }
-                    role={isClickable ? "button" : undefined}
-                    tabIndex={isClickable ? 0 : undefined}
+                    role={rowClickable ? "button" : undefined}
+                    tabIndex={rowClickable ? 0 : undefined}
                   >
                     <td
                       className="min-w-[100px] max-w-[280px] break-words px-2 py-2 font-medium text-foreground"

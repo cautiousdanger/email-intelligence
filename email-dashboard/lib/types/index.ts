@@ -148,6 +148,25 @@ export interface FollowUpTrackerHistoryResponse {
   emails: FollowUpTrackerHistoryEmail[];
 }
 
+export interface DailyBulkSummaryDay {
+  date: string;
+  emailCount: number;
+  bulkSummary: string | null;
+  /** True when the UTC day is complete (always true for listed digest days). */
+  isCompleteDay?: boolean;
+}
+
+export interface DailyBulkSummariesResponse {
+  days: DailyBulkSummaryDay[];
+}
+
+export interface DailyBulkSummaryGenerateResponse {
+  ok: boolean;
+  date: string;
+  emailCount: number;
+  bulkSummary: string | null;
+}
+
 export type EmailStatus = "stored" | "failed";
 
 export type AiStatus = "pending" | "completed" | "failed";
@@ -176,6 +195,8 @@ export interface EmailRecord {
   assignedTeam?: string | null;
   /** Admin cross-mailbox lists (e.g. Deleted mail) */
   mailboxOwnerEmail?: string | null;
+  /** Soft-deleted / removed from History — list rows should not open detail. */
+  deletedAt?: string | null;
 }
 
 export interface EmailsResponse {
@@ -433,10 +454,18 @@ export interface UserOut {
   managerId: string | null;
   isTeamLead: boolean;
   reportCount: number;
+  /** Total non-deleted emails in this user's mailbox. */
+  emailCount?: number;
   /** Last successful /api/me sync (ISO). */
   lastLoginAt?: string | null;
   /** Account created in app DB (ISO). */
   createdAt?: string | null;
+}
+
+export interface UserEmailCountOut {
+  userId: string;
+  email: string;
+  emailCount: number;
 }
 
 export interface WorkflowNode {

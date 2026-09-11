@@ -13,6 +13,7 @@ export const config = {
     "/dashboard/:path*",
     "/emails",
     "/emails/:path*",
+    "/daily-digest",
     "/threads",
     "/threads/:path*",
     "/queue",

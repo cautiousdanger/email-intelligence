@@ -92,7 +92,7 @@ const TOUR_STEPS: TourStep[] = [
   },
   {
     id: "team-leaders",
-    title: "Admin: Team leaders",
+    title: "Admin: User management",
     description: "Manage users, role assignment, and login history.",
     href: "/admin/team-leaders",
     role: "admin",

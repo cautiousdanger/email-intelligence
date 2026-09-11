@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { useSession } from "next-auth/react";
 import { getApi } from "@/lib/api/client";
 import type { UserOut, TeamOut } from "@/lib/types";
@@ -32,6 +32,14 @@ function sortUsersByName(a: UserOut, b: UserOut): number {
   });
 }
 
+function formatEmailCount(n: number | undefined | null): string {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
+  return v.toLocaleString();
+}
+
+/** Poll interval while User management is open (matches dashboard mail sync refresh). */
+const EMAIL_COUNT_POLL_MS = 2500;
+
 export default function AdminTeamLeadersPage() {
   const { data: session, status } = useSession();
   const api = useMemo(
@@ -44,6 +52,7 @@ export default function AdminTeamLeadersPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const emailCountPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [me, setMe] = useState<{
     userId?: string;
     isAdmin?: boolean;
@@ -101,48 +110,99 @@ export default function AdminTeamLeadersPage() {
     return map;
   }, [allUsers]);
 
-  const load = () => {
-    if (status !== "authenticated") return;
-    setLoading(true);
-    setError(null);
-    api
-      .getMe()
-      .catch(() => null)
-      .then((meResp) => {
-        setMe(
-          meResp
-            ? {
-                userId: meResp.userId,
-                isAdmin: meResp.isAdmin,
-                role: meResp.role ?? "",
-                department: meResp.department ?? null,
-              }
-            : null
-        );
-        return Promise.all([api.getUsers({ role: "Manager" }), api.getTeams(), api.getUsers()]).then(([m, t, u]) => {
-          setManagers(m);
-          setTeams(t);
-          setAllUsers(u);
+  const load = useCallback(
+    (opts?: { silent?: boolean }) => {
+      if (status !== "authenticated") return;
+      if (!opts?.silent) {
+        setLoading(true);
+        setError(null);
+      }
+      api
+        .getMe()
+        .catch(() => null)
+        .then((meResp) => {
+          setMe(
+            meResp
+              ? {
+                  userId: meResp.userId,
+                  isAdmin: meResp.isAdmin,
+                  role: meResp.role ?? "",
+                  department: meResp.department ?? null,
+                }
+              : null
+          );
+          return Promise.all([api.getUsers({ role: "Manager" }), api.getTeams(), api.getUsers()]).then(
+            ([m, t, u]) => {
+              setManagers(m);
+              setTeams(t);
+              setAllUsers(u);
+            }
+          );
+        })
+        .catch(() => {
+          if (!opts?.silent) setError("Failed to load data");
+        })
+        .finally(() => {
+          if (!opts?.silent) setLoading(false);
         });
+    },
+    [status, api]
+  );
+
+  const applyEmailCounts = useCallback((counts: { userId: string; emailCount: number }[]) => {
+    const byId = new Map(counts.map((c) => [c.userId, c.emailCount]));
+    if (byId.size === 0) return;
+    setAllUsers((prev) =>
+      prev.map((u) => {
+        const next = byId.get(u.id);
+        return next === undefined || next === u.emailCount ? u : { ...u, emailCount: next };
       })
-      .catch(() => setError("Failed to load data"))
-      .finally(() => setLoading(false));
-  };
+    );
+  }, []);
+
+  const refreshEmailCounts = useCallback(() => {
+    if (status !== "authenticated") return;
+    api
+      .getUserEmailCounts()
+      .then(applyEmailCounts)
+      .catch(() => {
+        /* ignore transient poll errors */
+      });
+  }, [status, api, applyEmailCounts]);
 
   useEffect(() => {
     load();
-  }, [status, api]);
+  }, [load]);
+
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    refreshEmailCounts();
+    emailCountPollRef.current = setInterval(refreshEmailCounts, EMAIL_COUNT_POLL_MS);
+    return () => {
+      if (emailCountPollRef.current) {
+        clearInterval(emailCountPollRef.current);
+        emailCountPollRef.current = null;
+      }
+    };
+  }, [status, refreshEmailCounts]);
+
+  /** Refresh roles/teams periodically; email counts use the faster poll above. */
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    const id = window.setInterval(() => load({ silent: true }), 60000);
+    return () => window.clearInterval(id);
+  }, [status, load]);
 
   const assignRole = (userId: string, role: string) => {
     if (!canEdit) return;
     setUpdatingId(userId);
-    api.updateUser(userId, { role }).then(() => load()).catch(() => setError("Failed to update")).finally(() => setUpdatingId(null));
+    api.updateUser(userId, { role }).then(() => load({ silent: true })).catch(() => setError("Failed to update")).finally(() => setUpdatingId(null));
   };
 
   const assignTeam = (userId: string, teamId: string) => {
     if (!canEdit) return;
     setUpdatingId(userId);
-    api.updateUser(userId, { teamId: teamId || undefined }).then(() => load()).catch(() => setError("Failed to update")).finally(() => setUpdatingId(null));
+    api.updateUser(userId, { teamId: teamId || undefined }).then(() => load({ silent: true })).catch(() => setError("Failed to update")).finally(() => setUpdatingId(null));
   };
 
   const assignReportingTo = (userId: string, managerId: string) => {
@@ -150,7 +210,7 @@ export default function AdminTeamLeadersPage() {
     setUpdatingId(userId);
     api
       .updateUser(userId, { managerId })
-      .then(() => load())
+      .then(() => load({ silent: true }))
       .catch(() => setError("Failed to update reporting manager"))
       .finally(() => setUpdatingId(null));
   };
@@ -159,7 +219,7 @@ export default function AdminTeamLeadersPage() {
     <div className="min-w-0 max-w-full space-y-4 sm:space-y-6">
       <div className="min-w-0">
         <h1 className="text-xl font-bold tracking-tight text-neutral-900 dark:text-neutral-50 sm:text-2xl">
-          Team leaders
+          User management
         </h1>
       </div>
 
@@ -232,7 +292,7 @@ export default function AdminTeamLeadersPage() {
             <Users className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
             <span className="min-w-0 break-words">
               {canEdit
-                ? "All users - assign role or team (by recent activity)"
+                ? "All users - assign role or team"
                 : "Members assigned to me"}
             </span>
           </CardTitle>
@@ -257,7 +317,7 @@ export default function AdminTeamLeadersPage() {
                       {u.email} · {u.teamName ?? "-"}
                     </p>
                     <p className="mt-1 break-words text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-                      Last visit: <span className="tabular-nums">{formatActivity(u.lastLoginAt)}</span> · Joined:{" "}
+                      Emails: <span className="tabular-nums font-medium text-neutral-700 dark:text-neutral-300">{formatEmailCount(u.emailCount)}</span> · Joined:{" "}
                       <span className="tabular-nums">{formatActivity(u.createdAt)}</span>
                     </p>
                   </div>

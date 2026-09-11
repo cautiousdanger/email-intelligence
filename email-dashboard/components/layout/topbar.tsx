@@ -80,6 +80,7 @@ function notificationIcon(kind: string): LucideIcon {
 const pathToLabel: Record<string, string> = {
   "/dashboard": "Dashboard",
   "/emails": "Mailbox",
+  "/daily-digest": "Daily digest",
   "/threads": "Threads",
   "/departments": "Departments",
   "/escalations": "Escalations",
@@ -93,7 +94,7 @@ const pathToLabel: Record<string, string> = {
   "/queue": "Queue",
   "/settings": "Settings",
   "/admin/my-projects": "Projects",
-  "/admin/team-leaders": "Team leaders",
+  "/admin/team-leaders": "User management",
   "/admin/team-projects": "Projects",
   "/admin/tracker": "Tracker",
   "/admin/review": "Review",
